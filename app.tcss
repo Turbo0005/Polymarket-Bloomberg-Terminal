@@ -1,0 +1,90 @@
+Screen {
+    background: #0d1117;
+    color: #c9d1d9;
+}
+
+#header {
+    dock: top;
+    height: 1;
+    background: #161b22;
+    color: #f0883e;
+    text-style: bold;
+}
+
+#main {
+    height: 1fr;
+}
+
+#left-pane {
+    width: 45%;
+    min-width: 28;
+    border: solid #30363d;
+}
+
+#right-pane {
+    width: 1fr;
+    border: solid #30363d;
+}
+
+#detail {
+    height: 12;
+    min-height: 8;
+    background: #0d1117;
+    border-bottom: solid #30363d;
+    padding: 0 1;
+}
+
+#book-row {
+    height: 1fr;
+}
+
+#bids {
+    width: 1fr;
+    border: solid #238636;
+}
+
+#asks {
+    width: 1fr;
+    border: solid #da3633;
+}
+
+#footer {
+    dock: bottom;
+    height: 1;
+    background: #161b22;
+    color: #8b949e;
+}
+
+DataTable {
+    background: #0d1117;
+}
+
+DataTable > .datatable--header {
+    background: #21262d;
+    color: #f0883e;
+    text-style: bold;
+}
+
+#filter-input {
+    width: 1fr;
+    height: 1;
+    background: #161b22;
+    border: none;
+    padding: 0 1;
+}
+
+#filter-input:focus {
+    border: none;
+}
+
+.market-yes {
+    color: #3fb950;
+}
+
+.market-no {
+    color: #f85149;
+}
+
+.market-muted {
+    color: #8b949e;
+}
