@@ -1,23 +1,13 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
 
 [project]
-name = "pm-terminal"
-version = "1.0.0"
-description = "Bloomberg-style Polymarket terminal using polymarket CLI JSON output"
-readme = "README.md"
-requires-python = ">=3.11"
-dependencies = [
-    "textual>=0.86.0",
-]
+name = "polymarket-terminal"
+version = "3.0.0"
+description = "Bloomberg-style Polymarket terminal powered by the Polymarket CLI"
+requires-python = ">=3.10"
+license = {text = "MIT"}
 
 [project.scripts]
-pm-term = "pm_terminal.__main__:main"
-
-[tool.hatch.build.targets.wheel]
-packages = ["pm_terminal"]
-
-[tool.ruff]
-line-length = 100
-target-version = "py311"
+pm-terminal = "polymarket_terminal:main"

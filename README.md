@@ -1,47 +1,94 @@
 # Polymarket Bloomberg Terminal
 
-Bloomberg-style Polymarket terminal in the terminal. Uses the official [Polymarket CLI](https://github.com/Polymarket/polymarket-cli) with `-o json` and polls on an interval.
+A Bloomberg-style terminal interface for real-time Polymarket prediction market data, built entirely in Python using only the standard library (`curses`).
 
-(near real-time; the CLI does not stream)
+## Features
+
+- **Scrolling ticker tape** with live market prices in cents
+- **Markets list** with YES/NO prices, chart bars, and volume
+- **3 stacked orderbook panels** with depth bars, spread in bps, imbalance %, cumulative size, and bid/ask level counts
+- **Live assets panel** in two-column layout showing derived crypto/stock prices
+- **Traders leaderboard** with switchable periods (Day/Week/Month)
+- **Events panel** with 24h volume
+- **Real-time trade feed** with color-coded BUY/SELL entries
+- **3 color palettes** — Bloomberg (default), Amber, Matrix
+- **Unicode box-drawing** characters for clean terminal borders
+- **Keyboard navigation** — j/k or arrows to scroll markets, r to refresh, q to quit
 
 ## Prerequisites
 
-- Python 3.11+
-- `polymarket` on your `PATH` (see upstream install: Homebrew tap or install script).
-
-## Install
+- Python 3.10+
+- [Polymarket CLI](https://github.com/Polymarket/polymarket-cli) installed and configured
 
 ```bash
-cd PolyMarket_BT
-python3 -m venv .venv && source .venv/bin/activate  # optional
-pip install -e .
+# Install the polymarket CLI
+npm install -g @polymarket/cli
+
+# Configure it
+polymarket setup
 ```
 
-## Run
+## Usage
 
 ```bash
-pm-term
-# or: python -m pm_terminal
+# Run the terminal UI
+python3 polymarket_terminal.py
+
+# Custom refresh interval (seconds)
+python3 polymarket_terminal.py --refresh 10
+
+# Limit number of markets queried
+python3 polymarket_terminal.py --market-limit 60
+
+# Adjust number of orderbook panels (1-4)
+python3 polymarket_terminal.py --book-panels 2
+
+# Single data probe (no UI)
+python3 polymarket_terminal.py --once
 ```
 
-### Options / environment
+## Keyboard Controls
 
+| Key | Action |
+|-----|--------|
+| `q` | Quit |
+| `r` | Force refresh |
+| `j` / `↓` | Select next market |
+| `k` / `↑` | Select previous market |
+| `1` | Leaderboard: Day |
+| `2` | Leaderboard: Week |
+| `3` | Leaderboard: Month |
+| `p` | Cycle color palette |
 
-| Flag           | Env                | Default      | Meaning                                   |
-| -------------- | ------------------ | ------------ | ----------------------------------------- |
-| `--polymarket` | `POLYMARKET_BIN`   | `polymarket` | CLI binary path                           |
-| `--interval`   | `PM_TERM_INTERVAL` | `4`          | Seconds between market list refreshes     |
-| `--limit`      | `PM_TERM_LIMIT`    | `40`         | `markets list --limit`                    |
-| `--order`      | `PM_TERM_ORDER`    | `volumeNum`  | `markets list --order` (camelCase fields) |
-| `--timeout`    | `PM_TERM_TIMEOUT`  | `60`         | Subprocess timeout (seconds)              |
+## Terminal Requirements
 
+Minimum terminal size: **110 columns x 24 rows**. For the best experience, use a full-screen terminal with 160+ columns.
 
-## Keys
+## Architecture
 
-- `q` — quit  
-- `r` — refresh list and selection  
-- `j` / `k` or arrows — move selection  
-- `/` — focus filter (substring on question, client-side)  
-- `Escape` — clear filter when filter is focused
+```
+polymarket CLI (subprocess + JSON)
+        │
+        ▼
+DataCollector (background thread)
+        │
+        ▼
+    Snapshot (dataclass)
+        │
+        ▼
+  TerminalUI (curses)
+   ┌────┼────────────────────────┐
+   │    │    ┌─────┐ ┌─────────┐ │
+   │ Markets │Books│ │ Assets  │ │
+   │         │     │ │ Traders │ │
+   │ Trades  │     │ │ Events  │ │
+   └─────────┴─────┘ └─────────┘ │
+   │         Footer               │
+   └──────────────────────────────┘
+```
 
-Updates are polling-based; lower `--interval` refreshes more often but loads the API more heavily.
+## Dependencies
+
+**None beyond Python's standard library.** The application uses `curses`, `subprocess`, `json`, `threading`, `argparse`, `dataclasses`, `collections`, `datetime`, `time`, `locale`, and `random`.
+
+Data is sourced exclusively via the `polymarket` CLI tool.
