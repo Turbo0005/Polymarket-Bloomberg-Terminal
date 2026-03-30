@@ -14,8 +14,8 @@ import argparse
 import curses
 import json
 import locale
-import random
 import subprocess
+import urllib.request
 import threading
 import time
 from collections import deque
@@ -27,11 +27,19 @@ from typing import Any
 
 DEFAULT_REFRESH = 6.0
 MARKET_LIMIT = 120
-BOOK_PANELS = 3
 TRADE_CAPACITY = 80
 LOG_CAPACITY = 200
-AUX_REFRESH = 30.0
 PRICE_HISTORY_LEN = 12
+
+TICKER_MARKET_LIMIT = 16
+TRADE_API_URL = "https://data-api.polymarket.com/trades"
+TRADE_FETCH_LIMIT = 25
+TRADE_API_TIMEOUT = 10.0
+TRADE_SEEN_CAP = 500
+
+CLI_TIMEOUT_DEFAULT = 20.0
+CLI_TIMEOUT_MARKETS = 30.0
+CLI_TIMEOUT_BOOKS = 20.0
 
 # Unicode box-drawing
 TL, TR, BL, BR = "┌", "┐", "└", "┘"
@@ -39,7 +47,6 @@ HZ, VT = "─", "│"
 TJ, BJ, LJ, RJ, CX = "┬", "┴", "├", "┤", "┼"
 
 SPARK = "▁▂▃▄▅▆▇█"
-BLOCK = "█"
 
 # Color pair IDs
 CP_GREEN = 1
@@ -115,6 +122,27 @@ def trunc(text: str, w: int) -> str:
     return text[: max(0, w - 3)] + "..." if w > 3 else text[:w]
 
 
+def word_wrap(text: str, w: int) -> list[str]:
+    """Simple word-wrap that respects width *w*."""
+    if w <= 0:
+        return []
+    lines: list[str] = []
+    for paragraph in text.split("\n"):
+        words = paragraph.split()
+        if not words:
+            lines.append("")
+            continue
+        cur = words[0]
+        for word in words[1:]:
+            if len(cur) + 1 + len(word) <= w:
+                cur += " " + word
+            else:
+                lines.append(cur)
+                cur = word
+        lines.append(cur)
+    return lines
+
+
 # ─── Formatting ───────────────────────────────────────────────────────────────
 
 
@@ -150,23 +178,89 @@ def fmt_money(v: float | None) -> str:
     return f"{sign}${a:,.0f}"
 
 
-def fmt_price(v: float | None) -> str:
+def fmt_notional(v: float | None) -> str:
+    """Format USD order-book notionals (price × size); keeps decimals when < $1."""
     if v is None:
         return "  --"
     a = abs(v)
-    if a >= 1000:
-        return f"${v:,.0f}"
+    sign = "-" if v < 0 else ""
+    if a >= 1_000_000:
+        return f"{sign}${a / 1_000_000:,.1f}M"
+    if a >= 1_000:
+        return f"{sign}${a / 1_000:,.1f}K"
+    if a >= 100:
+        return f"{sign}${a:,.0f}"
     if a >= 1:
-        return f"${v:,.2f}"
-    return f"${v:.4f}"
+        return f"{sign}${a:.1f}"
+    if a >= 0.01:
+        return f"{sign}${a:.2f}"
+    if a > 1e-9:
+        return f"{sign}${a:.3f}"
+    return f"{sign}$0"
 
 
-def fmt_change(v: float | None) -> str:
+def fmt_shares(v: float | None) -> str:
+    """Format order-book level size (share / contract count)."""
     if v is None:
         return "  --"
-    if v >= 0:
-        return f"\u2191{v:.2%}"
-    return f"\u2193{abs(v):.2%}"
+    a = abs(v)
+    sign = "-" if v < 0 else ""
+    if a >= 1_000_000:
+        return f"{sign}{a / 1_000_000:,.1f}M"
+    if a >= 1_000:
+        return f"{sign}{a / 1_000:,.1f}K"
+    if a >= 100:
+        return f"{sign}{a:,.0f}"
+    if a >= 1:
+        t = f"{sign}{a:,.2f}"
+        return t.rstrip("0").rstrip(".") if "." in t else t
+    if a > 1e-9:
+        return f"{sign}{a:.3g}"
+    return f"{sign}0"
+
+
+def orderbook_triple_widths(half: int) -> tuple[int, int, int]:
+    """Balanced column widths for PRICE / SHARE / TOTAL; two spaces between; sum = *half*."""
+    sp = 2
+    rem = half - sp
+    if rem < 3:
+        return 1, 1, max(1, rem - 2)
+
+    # Ideal widths: PRICE 6, SHARE 6, TOTAL 6 (needs rem=18 / half=20).
+    # Minimums: PRICE 5 ("99.0¢"), SHARE 5 ("SHARE"), TOTAL 5 ("$1.2K").
+    ideal_px, ideal_sh, ideal_tot = 6, 6, 6
+    min_px, min_sh, min_tot = 5, 5, 5
+
+    if rem >= ideal_px + ideal_sh + ideal_tot:
+        extra = rem - ideal_px - ideal_sh - ideal_tot
+        # Distribute surplus evenly: TOT first, then SHARE, then PR.
+        tot_w = ideal_tot + extra // 3
+        sh_w = ideal_sh + (extra - extra // 3) // 2
+        px_w = rem - sh_w - tot_w
+        return px_w, sh_w, tot_w
+
+    if rem >= min_px + min_sh + min_tot:
+        short = (min_px + min_sh + min_tot) - rem
+        px_w = min_px
+        sh_w = min_sh
+        tot_w = rem - px_w - sh_w
+        if tot_w < min_tot:
+            sh_w -= min_tot - tot_w
+            tot_w = min_tot
+        return px_w, max(3, sh_w), tot_w
+
+    # Very narrow: split as evenly as possible.
+    px_w = max(2, rem // 3)
+    sh_w = max(2, (rem - px_w) // 2)
+    tot_w = rem - px_w - sh_w
+    return px_w, sh_w, max(2, tot_w)
+
+
+def pad_orderbook_cell(text: str, width: int, *, right: bool = True) -> str:
+    """Truncate then pad so each row stays a fixed character width."""
+    if len(text) > width:
+        text = trunc(text, width)
+    return text.rjust(width) if right else text.ljust(width)
 
 
 def fmt_pct(v: float | None) -> str:
@@ -195,33 +289,6 @@ def sparkline(values: list[float], width: int = 8) -> str:
     return out.ljust(width)[:width]
 
 
-def chart_bar(prob: float | None, width: int) -> str:
-    if prob is None or width <= 0:
-        return " " * width
-    fill = int(prob * width)
-    fill = clamp(fill, 0, width)
-    return (BLOCK * fill).ljust(width)[:width]
-
-
-def depth_bar(size: float, max_size: float, width: int) -> str:
-    if max_size <= 0 or width <= 0:
-        return " " * width
-    fill = int(size / max_size * width)
-    fill = clamp(fill, 0, width)
-    return (BLOCK * fill).ljust(width)[:width]
-
-
-def guess_symbol(q: str) -> str | None:
-    upper = q.upper()
-    for sym in [
-        "BTC", "ETH", "SOL", "XRP", "NVDA", "TSLA", "SPY", "QQQ",
-        "AAPL", "MSFT", "AMZN", "META", "GOOGL", "COIN", "EUR/USD",
-    ]:
-        if sym in upper:
-            return sym
-    return None
-
-
 # ─── Data Models ──────────────────────────────────────────────────────────────
 
 
@@ -240,7 +307,11 @@ class MarketRow:
     token_ids: list[str]
     accepting_orders: bool
     one_day_change: float | None
-    symbol_hint: str | None
+    event_id: str
+    event_title: str
+    group_item_title: str
+    end_date: str
+    description: str
 
     @property
     def mid(self) -> float | None:
@@ -280,9 +351,12 @@ class BookSnapshot:
         return sum(s for _, s in self.asks)
 
     @property
-    def imbalance(self) -> float:
-        t = self.total_bid + self.total_ask
-        return (self.total_bid / t) if t > 0 else 0.5
+    def total_bid_usd(self) -> float:
+        return sum(p * s for p, s in self.bids)
+
+    @property
+    def total_ask_usd(self) -> float:
+        return sum(p * s for p, s in self.asks)
 
 
 @dataclass
@@ -299,15 +373,13 @@ class TradeEntry:
     price_cents: float
     size: float
     market_name: str
+    outcome: str = ""
 
 
 @dataclass
 class Snapshot:
     markets: list[MarketRow] = field(default_factory=list)
     book_panels: list[BookPanel] = field(default_factory=list)
-    leaderboard: list[dict[str, Any]] = field(default_factory=list)
-    events: list[dict[str, Any]] = field(default_factory=list)
-    assets: list[dict[str, Any]] = field(default_factory=list)
     trades: list[TradeEntry] = field(default_factory=list)
     logs: list[str] = field(default_factory=list)
     refreshed_at: float = 0.0
@@ -322,10 +394,9 @@ class Snapshot:
 class DataCollector:
     """Background thread that polls the polymarket CLI and builds snapshots."""
 
-    def __init__(self, refresh: float, limit: int, panels: int):
+    def __init__(self, refresh: float, limit: int):
         self.refresh = max(1.0, refresh)
         self.limit = max(20, limit)
-        self.panels = clamp(panels, 1, 4)
 
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -336,12 +407,8 @@ class DataCollector:
         self._logs: deque[str] = deque(maxlen=LOG_CAPACITY)
         self._trades: deque[TradeEntry] = deque(maxlen=TRADE_CAPACITY)
         self._focus = 0
-        self._lb_period = "day"
 
-        self._cached_lb: list[dict[str, Any]] = []
-        self._cached_ev: list[dict[str, Any]] = []
-        self._last_aux = 0.0
-        self._prev_markets: dict[str, float] = {}
+        self._seen_tx: set[str] = set()
         self._price_hist: dict[str, list[float]] = {}
 
     # ── Public API ────────────────────────────────────────────────────────
@@ -362,13 +429,6 @@ class DataCollector:
         with self._lock:
             self._focus = max(0, idx)
 
-    def set_lb_period(self, period: str) -> None:
-        with self._lock:
-            self._lb_period = period
-            self._cached_lb = []
-            self._last_aux = 0.0
-        self._force.set()
-
     def request_refresh(self) -> None:
         self._force.set()
 
@@ -377,9 +437,6 @@ class DataCollector:
             return Snapshot(
                 markets=list(self._snapshot.markets),
                 book_panels=list(self._snapshot.book_panels),
-                leaderboard=list(self._snapshot.leaderboard),
-                events=list(self._snapshot.events),
-                assets=list(self._snapshot.assets),
                 trades=list(self._trades),
                 logs=list(self._logs),
                 refreshed_at=self._snapshot.refreshed_at,
@@ -389,7 +446,7 @@ class DataCollector:
             )
 
     def collect_once(self) -> Snapshot:
-        return self._cycle(1, force_aux=True)
+        return self._cycle(1)
 
     # ── Background loop ───────────────────────────────────────────────────
 
@@ -415,11 +472,10 @@ class DataCollector:
                     self._force.clear()
                     break
 
-    def _cycle(self, cycle: int, force_aux: bool = False) -> Snapshot:
+    def _cycle(self, cycle: int) -> Snapshot:
         with self._lock:
             focus = self._focus
             prev = self._snapshot
-            period = self._lb_period
 
         errors: list[str] = []
 
@@ -430,11 +486,15 @@ class DataCollector:
             errors.append(f"markets: {e}")
 
         self._update_history(markets)
-        self._generate_trades(markets)
+
+        try:
+            self._fetch_trades()
+        except Exception as e:
+            self._log(f"trades: {e}")
 
         focus = clamp(focus, 0, max(0, len(markets) - 1))
-        panel_markets = self._pick_panels(markets, focus)
-        token_ids = [m.token_ids[0] for m in panel_markets if m.token_ids]
+        panel_market = self._pick_focus_market(markets, focus)
+        token_ids = [panel_market.token_ids[0]] if (panel_market and panel_market.token_ids) else []
 
         try:
             books = self._fetch_books(token_ids)
@@ -442,46 +502,19 @@ class DataCollector:
             books = {}
             errors.append(f"books: {e}")
 
-        now = time.monotonic()
-        need_aux = force_aux or (now - self._last_aux) >= AUX_REFRESH
-        if need_aux or not self._cached_lb:
-            try:
-                self._cached_lb = self._fetch_leaderboard(period)
-            except Exception as e:
-                errors.append(f"leaderboard: {e}")
-        if need_aux or not self._cached_ev:
-            try:
-                self._cached_ev = self._fetch_events()
-            except Exception as e:
-                errors.append(f"events: {e}")
-        if need_aux:
-            self._last_aux = now
-
-        try:
-            assets = self._derive_assets(markets)
-        except Exception as e:
-            assets = []
-            errors.append(f"assets: {e}")
-
-        panels = [
-            BookPanel(market=m, token_id=tid, book=books.get(tid))
-            for m, tid in zip(panel_markets, token_ids)
-        ]
+        panels = []
+        if panel_market and token_ids:
+            tid = token_ids[0]
+            panels.append(BookPanel(market=panel_market, token_id=tid, book=books.get(tid)))
 
         if errors:
             self._log("partial: " + "; ".join(errors))
         else:
-            self._log(
-                f"ok: {len(markets)}mkt {len(panels)}bk "
-                f"{len(self._cached_ev)}ev {len(self._cached_lb)}lb"
-            )
+            self._log(f"ok: {len(markets)}mkt {len(panels)}bk")
 
         return Snapshot(
             markets=markets,
             book_panels=panels,
-            leaderboard=list(self._cached_lb),
-            events=list(self._cached_ev),
-            assets=assets,
             trades=list(self._trades),
             logs=list(self._logs),
             refreshed_at=time.time(),
@@ -492,7 +525,7 @@ class DataCollector:
 
     # ── CLI runner ────────────────────────────────────────────────────────
 
-    def _cli(self, args: list[str], timeout: float = 20.0) -> Any:
+    def _cli(self, args: list[str], timeout: float = CLI_TIMEOUT_DEFAULT) -> Any:
         cmd = ["polymarket", *args, "-o", "json"]
         proc = subprocess.run(
             cmd, check=False, text=True, capture_output=True, timeout=timeout,
@@ -512,18 +545,15 @@ class DataCollector:
 
     def _fetch_markets(self) -> list[MarketRow]:
         raw = None
-        try:
-            raw = self._cli(
-                ["markets", "list", "--active", "true", "--closed", "false",
-                 "--limit", str(self.limit), "--order", "volume"],
-                timeout=30.0,
-            )
-        except RuntimeError:
-            raw = self._cli(
-                ["markets", "list", "--active", "true", "--closed", "false",
-                 "--limit", str(self.limit)],
-                timeout=30.0,
-            )
+        # NOTE: Don't pass `--order volume`.
+        # In some polymarket-cli versions, ordering by `volume` causes the
+        # returned volume/liquidity fields to be zero, which then makes
+        # the UI show incorrect constant values.
+        raw = self._cli(
+            ["markets", "list", "--active", "true", "--closed", "false",
+             "--limit", str(self.limit)],
+            timeout=CLI_TIMEOUT_MARKETS,
+        )
         if not isinstance(raw, list):
             return []
 
@@ -532,6 +562,8 @@ class DataCollector:
             if not isinstance(item, dict):
                 continue
             q = str(item.get("question") or item.get("slug") or "unknown")
+            event_data = item.get("events") or []
+            ev0 = event_data[0] if isinstance(event_data, list) and event_data else {}
             rows.append(MarketRow(
                 question=q,
                 condition_id=str(item.get("conditionId") or ""),
@@ -549,7 +581,11 @@ class DataCollector:
                 token_ids=parse_token_ids(item.get("clobTokenIds")),
                 accepting_orders=bool(item.get("acceptingOrders")),
                 one_day_change=parse_opt_float(item.get("oneDayPriceChange")),
-                symbol_hint=guess_symbol(q),
+                event_id=str(ev0.get("id") or ""),
+                event_title=str(ev0.get("title") or ""),
+                group_item_title=str(item.get("groupItemTitle") or ""),
+                end_date=str(item.get("endDateIso") or ""),
+                description=str(item.get("description") or ""),
             ))
         rows.sort(
             key=lambda m: (1 if m.accepting_orders else 0, m.volume_24h, m.volume_total),
@@ -580,7 +616,10 @@ class DataCollector:
     def _fetch_books(self, token_ids: list[str]) -> dict[str, BookSnapshot]:
         if not token_ids:
             return {}
-        raw = self._cli(["clob", "books", ",".join(token_ids)], timeout=20.0)
+        raw = self._cli(
+            ["clob", "books", ",".join(token_ids)],
+            timeout=CLI_TIMEOUT_BOOKS,
+        )
         if isinstance(raw, dict):
             raw = [raw]
         if not isinstance(raw, list):
@@ -594,90 +633,24 @@ class DataCollector:
                 out[token_ids[i]] = b
         return out
 
-    def _fetch_leaderboard(self, period: str = "day") -> list[dict[str, Any]]:
-        raw = self._cli(
-            ["data", "leaderboard", "--period", period,
-             "--order-by", "pnl", "--limit", "10"],
-            timeout=16.0,
-        )
-        if not isinstance(raw, list):
-            return []
-        return [
-            {
-                "rank": int(item.get("rank") or 0),
-                "name": str(
-                    item.get("user_name")
-                    or item.get("proxy_wallet")
-                    or "anon"
-                ),
-                "pnl": parse_opt_float(item.get("pnl")),
-                "volume": parse_opt_float(item.get("volume")),
-            }
-            for item in raw if isinstance(item, dict)
-        ]
-
-    def _fetch_events(self) -> list[dict[str, Any]]:
-        raw = self._cli(
-            ["events", "list", "--active", "true", "--closed", "false",
-             "--limit", "8", "--order", "volume"],
-            timeout=20.0,
-        )
-        if not isinstance(raw, list):
-            return []
-        evs = [
-            {
-                "title": str(item.get("title") or item.get("slug") or "unknown"),
-                "volume": parse_float(
-                    item.get("volume24hr"), parse_float(item.get("volume"))
-                ),
-            }
-            for item in raw if isinstance(item, dict)
-        ]
-        evs.sort(key=lambda e: e["volume"], reverse=True)
-        return evs[:10]
-
-    def _derive_assets(self, markets: list[MarketRow]) -> list[dict[str, Any]]:
-        syms = [
-            "BTC", "ETH", "SOL", "XRP", "NVDA", "TSLA", "SPY", "QQQ",
-            "AAPL", "MSFT", "AMZN", "META", "GOOGL", "COIN", "EUR/USD",
-        ]
-        out: list[dict[str, Any]] = []
-        for sym in syms:
-            m = next(
-                (x for x in markets
-                 if x.accepting_orders and x.symbol_hint == sym),
-                None,
-            )
-            if m is None:
-                continue
-            out.append({
-                "symbol": sym,
-                "mid": m.mid,
-                "change": m.one_day_change,
-                "spread": m.spread,
-                "question": m.question,
-            })
-        return out[:16]
-
-    def _pick_panels(
+    def _pick_focus_market(
         self, markets: list[MarketRow], focus: int,
-    ) -> list[MarketRow]:
-        chosen: list[MarketRow] = []
-        for i in range(focus, len(markets)):
-            if len(chosen) >= self.panels:
-                break
-            m = markets[i]
-            if m.accepting_orders and m.token_ids and m not in chosen:
-                chosen.append(m)
-        for i in range(0, focus):
-            if len(chosen) >= self.panels:
-                break
-            m = markets[i]
-            if m.accepting_orders and m.token_ids and m not in chosen:
-                chosen.append(m)
-        return chosen
+    ) -> MarketRow | None:
+        if not markets:
+            return None
+        idx = clamp(focus, 0, len(markets) - 1)
+        m = markets[idx]
+        if m.accepting_orders and m.token_ids:
+            return m
+        for i in range(idx, len(markets)):
+            if markets[i].accepting_orders and markets[i].token_ids:
+                return markets[i]
+        for i in range(0, idx):
+            if markets[i].accepting_orders and markets[i].token_ids:
+                return markets[i]
+        return m
 
-    # ── Price history & synthetic trades ──────────────────────────────────
+    # ── Price history & live trades ───────────────────────────────────────
 
     def _update_history(self, markets: list[MarketRow]) -> None:
         for m in markets:
@@ -689,33 +662,44 @@ class DataCollector:
                     hist = hist[-PRICE_HISTORY_LEN:]
                 self._price_hist[key] = hist
 
-    def _generate_trades(self, markets: list[MarketRow]) -> None:
-        now = datetime.now().strftime("%H:%M:%S")
-        for m in markets[:25]:
-            if m.mid is None or not m.accepting_orders:
+    def _fetch_trades(self) -> None:
+        url = f"{TRADE_API_URL}?limit={TRADE_FETCH_LIMIT}&takerOnly=true"
+        req = urllib.request.Request(url, headers={
+            "Accept": "application/json",
+            "User-Agent": "PolymarketTerminal/3.1",
+        })
+        with urllib.request.urlopen(req, timeout=TRADE_API_TIMEOUT) as resp:
+            raw = json.loads(resp.read())
+        if not isinstance(raw, list):
+            return
+        new_entries: list[TradeEntry] = []
+        for item in raw:
+            if not isinstance(item, dict):
                 continue
-            key = m.condition_id or m.slug
-            prev_mid = self._prev_markets.get(key)
-            if prev_mid is not None and abs(prev_mid - m.mid) > 0.001:
-                side = "BUY" if m.mid > prev_mid else "SELL"
-                size = random.uniform(500, 200000)
-                self._trades.appendleft(TradeEntry(
-                    timestamp=now, side=side,
-                    price_cents=m.mid * 100.0,
-                    size=size, market_name=m.question,
-                ))
-            elif random.random() < 0.12:
-                side = random.choice(["BUY", "SELL"])
-                px = m.mid * 100.0 + random.uniform(-2, 2)
-                size = random.uniform(100, 50000)
-                self._trades.appendleft(TradeEntry(
-                    timestamp=now, side=side,
-                    price_cents=max(0.1, px),
-                    size=size, market_name=m.question,
-                ))
-        for m in markets:
-            if m.mid is not None:
-                self._prev_markets[m.condition_id or m.slug] = m.mid
+            tx = str(item.get("transactionHash") or "")
+            if tx and tx in self._seen_tx:
+                continue
+            if tx:
+                self._seen_tx.add(tx)
+            ts_unix = item.get("timestamp")
+            if ts_unix is not None:
+                ts_str = datetime.fromtimestamp(int(ts_unix)).strftime("%H:%M:%S")
+            else:
+                ts_str = datetime.now().strftime("%H:%M:%S")
+            price = parse_float(item.get("price"))
+            size = parse_float(item.get("size"))
+            new_entries.append(TradeEntry(
+                timestamp=ts_str,
+                side=str(item.get("side") or "BUY").upper(),
+                price_cents=price * 100.0,
+                size=price * size,
+                market_name=str(item.get("title") or "unknown"),
+                outcome=str(item.get("outcome") or ""),
+            ))
+        for entry in reversed(new_entries):
+            self._trades.appendleft(entry)
+        if len(self._seen_tx) > TRADE_SEEN_CAP:
+            self._seen_tx = set(list(self._seen_tx)[-TRADE_SEEN_CAP // 2:])
 
     def _log(self, msg: str) -> None:
         now = datetime.now().strftime("%H:%M:%S")
@@ -736,8 +720,6 @@ class TerminalUI:
         self.tape_off = 0
         self.tape_cache = ""
         self.palette = 0
-        self.lb_period = "day"
-        self.lb_label = "DAY"
         self.colors_ok = False
         self.frame = 0
 
@@ -833,15 +815,6 @@ class TerminalUI:
                 self.selected = min(len(snap.markets) - 1, self.selected + 1)
                 self.collector.set_focus(self.selected)
                 self.collector.request_refresh()
-        elif ch == ord("1"):
-            self.lb_period, self.lb_label = "day", "DAY"
-            self.collector.set_lb_period("day")
-        elif ch == ord("2"):
-            self.lb_period, self.lb_label = "week", "WEEK"
-            self.collector.set_lb_period("week")
-        elif ch == ord("3"):
-            self.lb_period, self.lb_label = "month", "MONTH"
-            self.collector.set_lb_period("month")
         elif ch in (ord("p"), ord("P")):
             self.palette = (self.palette + 1) % len(PALETTE_NAMES)
             self._apply_palette()
@@ -913,24 +886,24 @@ class TerminalUI:
         ftr_h = 1
         body_h = h - hdr_h - ftr_h
 
-        left_w = max(44, int(w * 0.35))
-        right_w = max(38, int(w * 0.28))
+        # Wider center column for orderbook (PRICE / SHARE / TOTAL); narrower side panels.
+        left_w = max(36, int(w * 0.27))
+        right_w = max(34, int(w * 0.25))
         center_w = w - left_w - right_w
-        if center_w < 38:
-            center_w = 38
-            over = left_w + right_w + center_w - w
-            if over > 0:
-                left_w = max(36, left_w - over // 2)
-                right_w = max(32, right_w - (over - over // 2))
-                center_w = w - left_w - right_w
-
-        mkt_h = int(body_h * 0.62)
-        trade_h = body_h - mkt_h
-
+        min_center = 46
+        for _ in range(40):
+            if center_w >= min_center:
+                break
+            if left_w > 30:
+                left_w -= 1
+            elif right_w > 28:
+                right_w -= 1
+            else:
+                break
+            center_w = w - left_w - right_w
 
         self._draw_header(snap, 0, 0, hdr_h, w)
-        self._draw_markets(snap, hdr_h, 0, mkt_h, left_w)
-        self._draw_trades(snap, hdr_h + mkt_h, 0, trade_h, left_w)
+        self._draw_markets(snap, hdr_h, 0, body_h, left_w)
         self._draw_books(snap, hdr_h, left_w, body_h, center_w)
         self._draw_right(snap, hdr_h, left_w + center_w, body_h, right_w)
         self._draw_footer(snap, h - ftr_h, 0, ftr_h, w)
@@ -945,7 +918,6 @@ class TerminalUI:
         self._box(y, x, h, w, "", CP_CYAN)
         iw = w - 4
 
-        # Row 1: scrolling ticker tape
         tape = self._build_tape(snap)
         if tape != self.tape_cache:
             self.tape_cache = tape
@@ -958,28 +930,22 @@ class TerminalUI:
         self._put(y + 1, x + 2, seg, CP_TICKER, curses.A_BOLD, iw)
         self.tape_off += 1
 
-        # Row 2: POLY badge + status + time
         ts = datetime.now().strftime("%H:%M:%S")
         n_mkt = len(snap.markets)
-        n_bk = len(snap.book_panels)
+        status_tag = "ERR" if snap.last_error else "LIVE"
         self._put(y + 2, x + 2, " POLY ", CP_YELLOW, curses.A_BOLD | curses.A_REVERSE)
-        status = (
-            f" {ts}  MKT:{n_mkt}  EXEC:{snap.cycle}  "
-            f"MDG:{n_bk}  MKT:LIVE  HTDS:LIVE"
-        )
+        status = f" {ts}  MKT:{n_mkt}  EXEC:{snap.cycle}  MKT:{status_tag}"
         self._put(y + 2, x + 8, status, CP_WHITE, 0, w - 20)
 
-        # Center: terminal title + commands
-        cmd = "POLYMARKET TERMINAL ~ r:refresh ~ 1/2/3:leaderboard ~ q:quit"
+        cmd = "POLYMARKET TERMINAL"
         cx = max(x + 40, x + (w - len(cmd)) // 2)
-        self._put(y + 2, cx, cmd, CP_CYAN, 0, w - cx + x - 2)
+        self._put(y + 2, cx, cmd, CP_CYAN, curses.A_BOLD, w - cx + x - 2)
 
-        # Right timestamp
         self._put(y + 2, x + w - len(ts) - 3, ts, CP_WHITE)
 
     def _build_tape(self, snap: Snapshot) -> str:
         pieces: list[str] = []
-        for m in snap.markets[:16]:
+        for m in snap.markets[:TICKER_MARKET_LIMIT]:
             if m.mid is None:
                 continue
             q = trunc(m.question, 30)
@@ -997,10 +963,12 @@ class TerminalUI:
         if iw < 20 or h < 4:
             return
 
-        name_w = max(10, iw - 34)
+        yes_w, no_w, vol_w = 6, 6, 8
+        fixed_w = yes_w + 1 + no_w + 1 + vol_w
+        name_w = max(8, iw - fixed_w)
         hdr = (
             f"{'MARKET':<{name_w}}"
-            f"{'YES':>6} {'NO':>6} {'CHART':>8} {'VOL':>10}"
+            f"{'YES':>{yes_w}} {'NO':>{no_w}} {'VOL':>{vol_w}}"
         )
         self._put(y + 1, x + 1, trunc(hdr, iw), CP_YELLOW, curses.A_BOLD, iw)
 
@@ -1023,27 +991,18 @@ class TerminalUI:
             yes = m.mid if m.mid is not None else m.best_bid
             no = (1.0 - yes) if yes is not None else None
 
-            key = m.condition_id or m.slug
-            hist = snap.price_history.get(key, [])
-            cbar = chart_bar(yes, 6) if yes is not None else "      "
-
             name = trunc(m.question, name_w - 1)
             line = (
                 f"{name:<{name_w}}"
-                f"{fmt_cents(yes):>6} "
-                f"{fmt_cents(no):>5} "
-                f"{cbar:>6} "
-                f"{fmt_vol(m.volume_24h):>10}"
+                f"{fmt_cents(yes):>{yes_w}} "
+                f"{fmt_cents(no):>{no_w}} "
+                f"{fmt_vol(m.volume_24h):>{vol_w}}"
             )
 
             if is_sel:
                 self._fill(y + 2 + i, x + 1, iw, line, CP_SELECTED, curses.A_BOLD)
             else:
                 self._put(y + 2 + i, x + 1, trunc(line, iw), CP_GREEN, 0, iw)
-                # Overlay chart in appropriate color
-                chart_x = x + 1 + name_w + 13
-                chart_cp = CP_GREEN if (m.one_day_change is None or m.one_day_change >= 0) else CP_RED
-                self._put(y + 2 + i, chart_x, cbar, chart_cp, 0, 6)
 
     # ── Trade feed ────────────────────────────────────────────────────────
 
@@ -1068,22 +1027,26 @@ class TerminalUI:
             if i >= ih:
                 break
             cp = CP_GREEN if t.side == "BUY" else CP_MAGENTA
-            name = trunc(t.market_name, max(10, iw - 40))
+            label = t.market_name
+            if t.outcome:
+                label = f"{t.market_name} [{t.outcome}]"
+            name = trunc(label, max(8, iw - 32))
+            usd = fmt_money(t.size) if t.size else "$0"
             line = (
-                f"{t.timestamp} & {t.side:<4} "
-                f"{t.price_cents:>5.1f}\u00a2"
-                f"+{t.size:>9,.1f} "
+                f"{t.timestamp}  {t.side:<4} "
+                f"{t.price_cents:>5.1f}\u00a2 "
+                f"{usd:>6} "
                 f"{VT} {name}"
             )
             self._put(y + 1 + i, x + 1, trunc(line, iw), cp, 0, iw)
 
-    # ── Orderbook panel ───────────────────────────────────────────────────
+    # ── Orderbook panel (single market, full height) ─────────────────────
 
     def _draw_books(
         self, snap: Snapshot, y: int, x: int, h: int, w: int,
     ) -> None:
         ts = datetime.now().strftime("%H:%M:%S")
-        self._box(y, x, h, w, f"LIVE ORDERBOOKS  {ts}", CP_CYAN)
+        self._box(y, x, h, w, f"LIVE ORDERBOOK  {ts}", CP_CYAN)
         iw = w - 2
         ih = h - 2
         if ih < 6 or iw < 30:
@@ -1091,250 +1054,233 @@ class TerminalUI:
 
         if not snap.book_panels:
             self._put(
-                y + 2, x + 2, "No active order books available.",
+                y + 2, x + 2, "No active order book available.",
                 CP_WHITE, 0, iw - 2,
             )
             return
 
-        n = len(snap.book_panels)
-        base_h = ih // n
-        extra = ih % n
+        panel = snap.book_panels[0]
         cy = y + 1
 
-        for pi, panel in enumerate(snap.book_panels):
-            bh = base_h + (1 if pi < extra else 0)
-            if bh < 5:
-                cy += bh
-                continue
+        self._put(
+            cy, x + 2,
+            trunc(panel.market.question, iw - 2),
+            CP_WHITE, curses.A_BOLD, iw - 2,
+        )
+        cy += 1
 
-            # Panel separator
-            if pi > 0:
-                self._put(cy, x + 1, HZ * iw, CP_CYAN)
-                cy += 1
-                bh -= 1
+        if panel.book is None:
+            self._put(cy, x + 2, "book unavailable", CP_RED, 0, iw - 2)
+            return
 
-            # Market title
-            self._put(
-                cy, x + 2,
-                trunc(panel.market.question, iw - 2),
-                CP_WHITE, curses.A_BOLD, iw - 2,
-            )
+        book = panel.book
+        mid = panel.market.mid
+        spread = panel.market.spread
+        spr_bps = panel.market.spread_bps
+
+        stats = (
+            f"MID:{fmt_cents(mid)}  "
+            f"SPRD:{fmt_cents(spread)} ({fmt_bps(spr_bps)})"
+        )
+        self._put(cy, x + 2, trunc(stats, iw - 2), CP_YELLOW, 0, iw - 2)
+        cy += 1
+
+        t_bid = book.total_bid_usd
+        t_ask = book.total_ask_usd
+        depth = (
+            f"BIDS:{fmt_notional(t_bid)}  "
+            f"ASKS:{fmt_notional(t_ask)}"
+        )
+        self._put(cy, x + 2, trunc(depth, iw - 2), CP_WHITE, 0, iw - 2)
+        cy += 1
+
+        bid_half = (iw - 3) // 2
+        ask_half_w = iw - 2 - bid_half - 3  # remaining interior after left-pad + bid + separator
+        half = min(bid_half, ask_half_w)     # use the smaller side for column-width calc
+        px_w, sh_w, tot_w = orderbook_triple_widths(half)
+        mid_sep = f" {VT} "
+
+        def _ob_hcell(label: str, wcol: int, *, right: bool) -> str:
+            return pad_orderbook_cell(trunc(label, wcol), wcol, right=right)
+
+        band_bid = "BID".center(bid_half)[:bid_half]
+        band_ask = "ASK".center(ask_half_w)[:ask_half_w]
+        self._put(
+            cy, x + 2, band_bid, CP_CYAN, curses.A_BOLD, bid_half,
+        )
+        self._put(cy, x + 2 + bid_half, mid_sep, CP_CYAN, curses.A_BOLD, 3)
+        self._put(
+            cy, x + 2 + bid_half + 3, band_ask, CP_CYAN, curses.A_BOLD, ask_half_w,
+        )
+        cy += 1
+
+        hdr_bid = (
+            f"{_ob_hcell('PRICE', px_w, right=True)} "
+            f"{_ob_hcell('SHARE', sh_w, right=True)} "
+            f"{_ob_hcell('TOTAL', tot_w, right=True)}"
+        ).ljust(bid_half)[:bid_half]
+        hdr_ask = (
+            f"{_ob_hcell('PRICE', px_w, right=False)} "
+            f"{_ob_hcell('SHARE', sh_w, right=False)} "
+            f"{_ob_hcell('TOTAL', tot_w, right=False)}"
+        ).ljust(ask_half_w)[:ask_half_w]
+        self._put(cy, x + 2, hdr_bid, CP_CYAN, curses.A_BOLD, bid_half)
+        self._put(cy, x + 2 + bid_half, mid_sep, CP_CYAN, curses.A_BOLD, 3)
+        self._put(cy, x + 2 + bid_half + 3, hdr_ask, CP_CYAN, curses.A_BOLD, ask_half_w)
+        cy += 1
+
+        data_rows = (y + h - 1) - cy
+        if data_rows <= 0:
+            return
+
+        bids = book.bids[:data_rows]
+        asks = book.asks[:data_rows]
+
+        for ri in range(data_rows):
+            bid = bids[ri] if ri < len(bids) else None
+            ask = asks[ri] if ri < len(asks) else None
+
+            if bid:
+                px_b, sh_b = bid[0], bid[1]
+                usd_b = px_b * sh_b
+                b_p = pad_orderbook_cell(fmt_cents(px_b), px_w)
+                b_s = pad_orderbook_cell(fmt_shares(sh_b), sh_w)
+                b_t = pad_orderbook_cell(fmt_notional(usd_b), tot_w)
+            else:
+                b_p = " " * px_w
+                b_s = " " * sh_w
+                b_t = " " * tot_w
+
+            if ask:
+                px_a, sh_a = ask[0], ask[1]
+                usd_a = px_a * sh_a
+                a_p = pad_orderbook_cell(fmt_cents(px_a), px_w, right=False)
+                a_s = pad_orderbook_cell(fmt_shares(sh_a), sh_w, right=False)
+                a_t = pad_orderbook_cell(fmt_notional(usd_a), tot_w, right=False)
+            else:
+                a_p = " " * px_w
+                a_s = " " * sh_w
+                a_t = " " * tot_w
+
+            row_bid = f"{b_p} {b_s} {b_t}".ljust(bid_half)[:bid_half]
+            row_ask = f"{a_p} {a_s} {a_t}".ljust(ask_half_w)[:ask_half_w]
+
+            self._put(cy, x + 2, row_bid, CP_GREEN, 0, bid_half)
+            self._put(cy, x + 2 + bid_half, mid_sep, CP_CYAN, 0, 3)
+            self._put(cy, x + 2 + bid_half + 3, row_ask, CP_MAGENTA, 0, ask_half_w)
             cy += 1
 
-            if panel.book is None:
-                self._put(cy, x + 2, "book unavailable", CP_RED, 0, iw - 2)
-                cy += bh - 1
-                continue
-
-            book = panel.book
-            mid = panel.market.mid
-            spread = panel.market.spread
-            spr_bps = panel.market.spread_bps
-            imbal = book.imbalance
-
-            # Price stats line
-            stats = (
-                f"MID:{fmt_cents(mid)}  "
-                f"SPRD:{fmt_cents(spread)} ({fmt_bps(spr_bps)})  "
-                f"IMBAL:{fmt_pct(imbal)}"
-            )
-            self._put(cy, x + 2, trunc(stats, iw - 2), CP_YELLOW, 0, iw - 2)
-            cy += 1
-
-            # Depth stats line
-            t_bid = book.total_bid
-            t_ask = book.total_ask
-            n_bid = len(book.bids)
-            n_ask = len(book.asks)
-            depth = (
-                f"BID:${t_bid:,.0f} ({n_bid}lvl)  "
-                f"ASK:${t_ask:,.0f} ({n_ask}lvl)"
-            )
-            self._put(cy, x + 2, trunc(depth, iw - 2), CP_WHITE, 0, iw - 2)
-            cy += 1
-
-            # Column header — adapt to available width
-            half = (iw - 3) // 2
-            bar_w = max(2, half - 22)
-            col_hdr = f"{'SIZE':>7} {'BAR':>{bar_w}} {'BID':>6} {VT} {'ASK':<6} {'BAR':<{bar_w}} {'SIZE':<7}"
-            self._put(
-                cy, x + 2,
-                trunc(col_hdr, iw - 2),
-                CP_CYAN, curses.A_BOLD, iw - 2,
-            )
-            cy += 1
-
-            # Bid/Ask rows
-            data_rows = bh - 5
-            if data_rows <= 0:
-                continue
-
-            bids = book.bids[:data_rows]
-            asks = book.asks[:data_rows]
-            max_bid_sz = max((s for _, s in bids), default=1.0) if bids else 1.0
-            max_ask_sz = max((s for _, s in asks), default=1.0) if asks else 1.0
-            cum_bid = 0.0
-            cum_ask = 0.0
-
-            for ri in range(data_rows):
-                bid = bids[ri] if ri < len(bids) else None
-                ask = asks[ri] if ri < len(asks) else None
-
-                if bid:
-                    cum_bid += bid[1]
-                    b_sz = fmt_vol(bid[1])
-                    b_bar = depth_bar(bid[1], max_bid_sz, bar_w)
-                    b_px = fmt_cents(bid[0])
-                else:
-                    b_sz = "      "
-                    b_bar = " " * bar_w
-                    b_px = "    "
-
-                if ask:
-                    cum_ask += ask[1]
-                    a_px = fmt_cents(ask[0])
-                    a_bar = depth_bar(ask[1], max_ask_sz, bar_w)
-                    a_sz = fmt_vol(ask[1])
-                else:
-                    a_px = "    "
-                    a_bar = " " * bar_w
-                    a_sz = "      "
-
-                bid_half = f"{b_sz:>7} {b_bar} {b_px:>6}"
-                ask_half = f"{a_px:<6} {a_bar} {a_sz:<7}"
-                mid_sep = f" {VT} "
-
-                self._put(cy, x + 2, bid_half, CP_GREEN, 0, half)
-                self._put(cy, x + 2 + half, mid_sep, CP_CYAN, 0, 3)
-                self._put(cy, x + 2 + half + 3, ask_half, CP_MAGENTA, 0, half)
-                cy += 1
-
-    # ── Right column ──────────────────────────────────────────────────────
+    # ── Right column: Market Detail + Related Markets ────────────────────
 
     def _draw_right(
         self, snap: Snapshot, y: int, x: int, h: int, w: int,
     ) -> None:
-        if h < 12:
+        if h < 8:
             self._box(y, x, h, w, "DATA", CP_CYAN)
             return
 
-        asset_h = max(6, h * 35 // 100)
-        trader_h = max(5, h * 30 // 100)
-        event_h = h - asset_h - trader_h
+        detail_h = max(8, h * 60 // 100)
+        related_h = h - detail_h
 
-        self._draw_assets(snap, y, x, asset_h, w)
-        self._draw_leaderboard(snap, y + asset_h, x, trader_h, w)
-        self._draw_events(snap, y + asset_h + trader_h, x, event_h, w)
+        self._draw_market_detail(snap, y, x, detail_h, w)
+        self._draw_related_markets(snap, y + detail_h, x, related_h, w)
 
-    # ── Assets panel ──────────────────────────────────────────────────────
-
-    def _draw_assets(
+    def _draw_market_detail(
         self, snap: Snapshot, y: int, x: int, h: int, w: int,
     ) -> None:
-        ts = datetime.now().strftime("%H:%M:%S")
-        n = len(snap.assets)
-        title = f"LIVE ASSETS  {ts}  {n}/{n} feeds"
-        self._box(y, x, h, w, title, CP_CYAN)
-
-        iw = w - 2
+        self._box(y, x, h, w, "MARKET DETAIL", CP_CYAN)
+        iw = w - 4
         ih = h - 2
-        if ih < 1 or iw < 20:
+        if ih < 2 or iw < 16:
             return
 
-        if not snap.assets:
-            self._put(y + 1, x + 2, "No asset feeds.", CP_WHITE, 0, iw - 2)
+        if not snap.markets:
+            self._put(y + 1, x + 2, "No market selected.", CP_WHITE, 0, iw)
             return
 
-        col_w = iw // 2
-        left_a = snap.assets[:8]
-        right_a = snap.assets[8:16]
+        sel = clamp(self.selected, 0, len(snap.markets) - 1)
+        m = snap.markets[sel]
+        cy = y + 1
 
-        for i, a in enumerate(left_a):
-            if i >= ih:
+        # Question (word-wrapped)
+        q_lines = word_wrap(m.question, iw)
+        for ql in q_lines[:3]:
+            if cy >= y + h - 1:
                 break
-            sym = a.get("symbol", "---")
-            mid = a.get("mid")
-            chg = a.get("change")
-            cp = CP_GREEN if (chg is None or chg >= 0) else CP_RED
-            p_str = fmt_price(mid) if mid else "  --"
-            c_str = fmt_change(chg) if chg is not None else ""
-            line = f"{sym:<6}{p_str:>10} {c_str:>8}"
-            self._put(y + 1 + i, x + 1, trunc(line, col_w), cp, 0, col_w)
+            self._put(cy, x + 2, ql, CP_WHITE, curses.A_BOLD, iw)
+            cy += 1
 
-        for i, a in enumerate(right_a):
-            if i >= ih:
+        if cy < y + h - 1:
+            cy += 1
+
+        # End date
+        if m.end_date and cy < y + h - 1:
+            self._put(cy, x + 2, f"Ends:  {m.end_date}", CP_CYAN, 0, iw)
+            cy += 1
+
+        if cy < y + h - 1:
+            cy += 1
+
+        # Stats block
+        stats = [
+            ("YES", fmt_cents(m.mid)),
+            ("NO", fmt_cents(1.0 - m.mid if m.mid is not None else None)),
+            ("Spread", f"{fmt_cents(m.spread)} ({fmt_bps(m.spread_bps)})"),
+            ("Vol 24h", fmt_vol(m.volume_24h)),
+            ("Vol Total", fmt_vol(m.volume_total)),
+            ("Liquidity", fmt_vol(m.liquidity)),
+        ]
+        for label, val in stats:
+            if cy >= y + h - 1:
                 break
-            sym = a.get("symbol", "---")
-            mid = a.get("mid")
-            chg = a.get("change")
-            cp = CP_GREEN if (chg is None or chg >= 0) else CP_RED
-            p_str = fmt_price(mid) if mid else "  --"
-            c_str = fmt_change(chg) if chg is not None else ""
-            line = f"{sym:<6}{p_str:>10} {c_str:>8}"
-            self._put(
-                y + 1 + i, x + 1 + col_w,
-                trunc(line, col_w), cp, 0, col_w,
-            )
+            line = f"{label + ':':<12}{val}"
+            self._put(cy, x + 2, trunc(line, iw), CP_YELLOW, 0, iw)
+            cy += 1
 
-    # ── Leaderboard panel ─────────────────────────────────────────────────
+        # Intentionally stop after core stats; trend and description are hidden.
 
-    def _draw_leaderboard(
+    def _draw_related_markets(
         self, snap: Snapshot, y: int, x: int, h: int, w: int,
     ) -> None:
-        self._box(y, x, h, w, f"TRADERS ({self.lb_label})", CP_CYAN)
-        iw = w - 2
+        self._box(y, x, h, w, "RELATED MARKETS", CP_CYAN)
+        iw = w - 4
         ih = h - 2
-        if ih < 2:
+        if ih < 2 or iw < 16:
             return
 
-        hdr = f"{'#':>2} {'NAME':<16} {'PnL':>10}"
-        self._put(y + 1, x + 1, trunc(hdr, iw), CP_YELLOW, curses.A_BOLD, iw)
+        if not snap.markets:
+            self._put(y + 1, x + 2, "No data.", CP_WHITE, 0, iw)
+            return
+
+        sel = clamp(self.selected, 0, len(snap.markets) - 1)
+        m = snap.markets[sel]
+
+        siblings: list[MarketRow] = []
+        if m.event_id:
+            siblings = [
+                s for s in snap.markets
+                if s.event_id == m.event_id and s.condition_id != m.condition_id
+            ]
+
+        if not siblings:
+            self._put(y + 1, x + 2, "No related markets for this event.", CP_WHITE, 0, iw)
+            return
+
+        name_w = max(8, iw - 18)
+        hdr = f"{'MARKET':<{name_w}} {'YES':>6} {'VOL':>10}"
+        self._put(y + 1, x + 2, trunc(hdr, iw), CP_YELLOW, curses.A_BOLD, iw)
 
         rows = ih - 1
-        if not snap.leaderboard:
-            self._put(
-                y + 2, x + 2, "Loading traders...",
-                CP_WHITE, 0, iw - 2,
-            )
-            return
-
-        for i, t in enumerate(snap.leaderboard[:rows]):
-            rank = t.get("rank", i + 1)
-            name = trunc(str(t.get("name", "anon")), 14)
-            pnl = t.get("pnl")
-            pnl_str = fmt_money(pnl)
-            cp = CP_GREEN if (pnl is not None and pnl >= 0) else CP_MAGENTA
-            line = f"{rank:>2} {name:<16} {pnl_str:>10}"
-            self._put(y + 2 + i, x + 1, trunc(line, iw), cp, 0, iw)
-
-    # ── Events panel ──────────────────────────────────────────────────────
-
-    def _draw_events(
-        self, snap: Snapshot, y: int, x: int, h: int, w: int,
-    ) -> None:
-        self._box(y, x, h, w, "EVENTS", CP_CYAN)
-        iw = w - 2
-        ih = h - 2
-        if ih < 2:
-            return
-
-        title_w = max(8, iw - 12)
-        hdr = f"{'EVENT':<{title_w}} {'VOL':>10}"
-        self._put(y + 1, x + 1, trunc(hdr, iw), CP_YELLOW, curses.A_BOLD, iw)
-
-        rows = ih - 1
-        if not snap.events:
-            self._put(
-                y + 2, x + 2, "Loading events...",
-                CP_WHITE, 0, iw - 2,
-            )
-            return
-
-        for i, ev in enumerate(snap.events[:rows]):
-            title = trunc(str(ev.get("title", "")), title_w)
-            vol = fmt_vol(parse_opt_float(ev.get("volume")))
-            line = f"{title:<{title_w}} {vol:>10}"
-            self._put(y + 2 + i, x + 1, trunc(line, iw), CP_WHITE, 0, iw)
+        for i, s in enumerate(siblings[:rows]):
+            if i + 2 > ih:
+                break
+            label = s.group_item_title if s.group_item_title else s.question
+            name = trunc(label, name_w - 1)
+            yes = fmt_cents(s.mid)
+            vol = fmt_vol(s.volume_24h)
+            line = f"{name:<{name_w}} {yes:>6} {vol:>10}"
+            cp = CP_GREEN if (s.one_day_change is None or s.one_day_change >= 0) else CP_RED
+            self._put(y + 2 + i, x + 2, trunc(line, iw), cp, 0, iw)
 
     # ── Footer ────────────────────────────────────────────────────────────
 
@@ -1342,10 +1288,8 @@ class TerminalUI:
         self, snap: Snapshot, y: int, x: int, h: int, w: int,
     ) -> None:
         pal = PALETTE_NAMES[self.palette]
-        left = (
-            " q:Quit  r:Refresh  1:LB:Day  2:LB:Week  3:LB:Month"
-        )
-        right = f"p:palette({pal}) "
+        left = " q:Quit  r:Refresh  j/k:Navigate  p:Palette"
+        right = f"palette({pal}) "
         gap = w - len(left) - len(right)
         line = left + " " * max(1, gap) + right
         self._put(y, x, trunc(line, w), CP_YELLOW, curses.A_BOLD, w)
@@ -1355,14 +1299,11 @@ class TerminalUI:
 
 
 def run_once(args: argparse.Namespace) -> int:
-    c = DataCollector(args.refresh, args.market_limit, args.book_panels)
+    c = DataCollector(args.refresh, args.market_limit)
     snap = c.collect_once()
     print("Polymarket terminal probe")
     print(f"  markets:     {len(snap.markets)}")
     print(f"  book panels: {len(snap.book_panels)}")
-    print(f"  leaderboard: {len(snap.leaderboard)}")
-    print(f"  events:      {len(snap.events)}")
-    print(f"  assets:      {len(snap.assets)}")
     if snap.markets:
         print("  top markets:")
         for m in snap.markets[:5]:
@@ -1372,7 +1313,7 @@ def run_once(args: argparse.Namespace) -> int:
 
 def run_ui(args: argparse.Namespace) -> int:
     locale.setlocale(locale.LC_ALL, "")
-    c = DataCollector(args.refresh, args.market_limit, args.book_panels)
+    c = DataCollector(args.refresh, args.market_limit)
     c.start()
     c.request_refresh()
 
@@ -1397,10 +1338,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--market-limit", type=int, default=MARKET_LIMIT,
         help=f"active markets to query (default: {MARKET_LIMIT})",
-    )
-    p.add_argument(
-        "--book-panels", type=int, default=BOOK_PANELS,
-        help=f"number of orderbook panels (default: {BOOK_PANELS})",
     )
     p.add_argument(
         "--once", action="store_true",
