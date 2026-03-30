@@ -722,6 +722,8 @@ class TerminalUI:
         self.palette = 0
         self.colors_ok = False
         self.frame = 0
+        self.search_mode = False
+        self.search_query = ""
 
         try:
             curses.curs_set(0)
@@ -789,6 +791,9 @@ class TerminalUI:
             snap = self.collector.snapshot()
             if snap.markets:
                 self.selected = clamp(self.selected, 0, len(snap.markets) - 1)
+                filtered = self._filtered_indices(snap)
+                if filtered and self.selected not in filtered:
+                    self.selected = filtered[0]
                 self.collector.set_focus(self.selected)
             else:
                 self.selected = 0
@@ -797,22 +802,71 @@ class TerminalUI:
             self._draw(snap)
             self.frame += 1
 
+    def _filtered_indices(self, snap: Snapshot) -> list[int]:
+        q = self.search_query.strip().lower()
+        if not q:
+            return list(range(len(snap.markets)))
+        out: list[int] = []
+        for i, m in enumerate(snap.markets):
+            hay = " ".join([
+                m.event_title,
+                m.group_item_title,
+                m.question,
+                m.slug,
+            ]).lower()
+            if q in hay:
+                out.append(i)
+        return out
+
+    def _move_selected(self, snap: Snapshot, step: int) -> None:
+        indices = self._filtered_indices(snap)
+        if not indices:
+            return
+        if self.selected not in indices:
+            self.selected = indices[0]
+            return
+        pos = indices.index(self.selected)
+        nxt = clamp(pos + step, 0, len(indices) - 1)
+        self.selected = indices[nxt]
+
     def _input(self, snap: Snapshot) -> bool:
         ch = self.stdscr.getch()
         if ch == -1:
             return True
         if ch in (ord("q"), ord("Q")):
             return False
+        if ch in (ord("/"),):
+            self.search_mode = True
+            return True
+
+        if self.search_mode:
+            if ch in (27,):  # ESC
+                self.search_mode = False
+                self.search_query = ""
+                return True
+            if ch in (curses.KEY_ENTER, 10, 13):
+                self.search_mode = False
+                return True
+            if ch in (curses.KEY_BACKSPACE, 127, 8):
+                self.search_query = self.search_query[:-1]
+                return True
+            if ch == 21:  # Ctrl+U
+                self.search_query = ""
+                return True
+            if 32 <= ch <= 126:
+                self.search_query += chr(ch)
+                return True
+
         if ch in (ord("r"), ord("R")):
             self.collector.request_refresh()
         elif ch in (curses.KEY_UP, ord("k"), ord("K")):
             if snap.markets:
-                self.selected = max(0, self.selected - 1)
+                self._move_selected(snap, -1)
                 self.collector.set_focus(self.selected)
                 self.collector.request_refresh()
         elif ch in (curses.KEY_DOWN, ord("j"), ord("J")):
             if snap.markets:
-                self.selected = min(len(snap.markets) - 1, self.selected + 1)
+                self._move_selected(snap, 1)
                 self.collector.set_focus(self.selected)
                 self.collector.request_refresh()
         elif ch in (ord("p"), ord("P")):
@@ -973,6 +1027,7 @@ class TerminalUI:
         self._put(y + 1, x + 1, trunc(hdr, iw), CP_YELLOW, curses.A_BOLD, iw)
 
         rows = h - 3
+        filtered = self._filtered_indices(snap)
         if rows <= 0 or not snap.markets:
             self._put(
                 y + 2, x + 2,
@@ -980,13 +1035,21 @@ class TerminalUI:
                 CP_WHITE, 0, iw - 2,
             )
             return
+        if not filtered:
+            self._put(
+                y + 2, x + 2,
+                f"No matches for '{trunc(self.search_query, max(8, iw - 20))}'",
+                CP_WHITE, 0, iw - 2,
+            )
+            return
 
-        scroll = max(0, self.selected - rows // 2)
-        scroll = min(scroll, max(0, len(snap.markets) - rows))
-        visible = snap.markets[scroll: scroll + rows]
+        cur_pos = filtered.index(self.selected) if self.selected in filtered else 0
+        scroll = max(0, cur_pos - rows // 2)
+        scroll = min(scroll, max(0, len(filtered) - rows))
+        visible_idx = filtered[scroll: scroll + rows]
 
-        for i, m in enumerate(visible):
-            ai = scroll + i
+        for i, ai in enumerate(visible_idx):
+            m = snap.markets[ai]
             is_sel = ai == self.selected
             yes = m.mid if m.mid is not None else m.best_bid
             no = (1.0 - yes) if yes is not None else None
@@ -1288,8 +1351,15 @@ class TerminalUI:
         self, snap: Snapshot, y: int, x: int, h: int, w: int,
     ) -> None:
         pal = PALETTE_NAMES[self.palette]
-        left = " q:Quit  r:Refresh  j/k:Navigate  p:Palette"
-        right = f"palette({pal}) "
+        if self.search_mode:
+            left = (
+                f"/ search: {self.search_query}_"
+                "  Enter:Apply  Esc:Clear  Backspace:Delete"
+            )
+            right = f"matches({len(self._filtered_indices(snap))}) "
+        else:
+            left = " q:Quit  /:Search events  r:Refresh  j/k:Navigate  p:Palette"
+            right = f"palette({pal}) "
         gap = w - len(left) - len(right)
         line = left + " " * max(1, gap) + right
         self._put(y, x, trunc(line, w), CP_YELLOW, curses.A_BOLD, w)
